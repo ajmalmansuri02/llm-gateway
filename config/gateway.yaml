@@ -1,0 +1,98 @@
+# llm-gateway routing config.
+# ${VAR} and ${VAR:-default} are expanded from the environment at startup.
+
+providers:
+  ollama:
+    type: openai_compatible            # Ollama serves an OpenAI-compatible API under /v1
+    base_url: ${OLLAMA_BASE_URL:-http://localhost:11434/v1}
+    timeout_s: 120
+  gemini:
+    type: gemini                       # native Gemini REST API (free tier key from AI Studio)
+    api_key: ${GEMINI_API_KEY:-}
+    timeout_s: 60
+  # Any other OpenAI-compatible server (vLLM, llama.cpp, LM Studio, a hosted API...).
+  openai_compat:
+    type: openai_compatible
+    base_url: ${OPENAI_COMPAT_BASE_URL:-http://localhost:8000/v1}
+    api_key: ${OPENAI_COMPAT_API_KEY:-}
+    timeout_s: 60
+  # In-process fake: echoes the prompt. Lets you load-test the gateway itself.
+  fake:
+    type: fake
+    timeout_s: 10
+    options:
+      latency_s: 0.05
+
+models:
+  # Clients call "chat-default"; the gateway tries Ollama first, then Gemini.
+  chat-default:
+    kind: chat
+    targets:
+      - provider: ollama
+        model: ${OLLAMA_CHAT_MODEL:-llama3.2:1b}
+      - provider: gemini
+        model: gemini-2.0-flash
+    semantic_cache: false
+  chat-local:
+    kind: chat
+    targets:
+      - provider: ollama
+        model: ${OLLAMA_CHAT_MODEL:-llama3.2:1b}
+  chat-gemini:
+    kind: chat
+    targets:
+      - provider: gemini
+        model: gemini-2.0-flash
+  demo-echo:
+    kind: chat
+    targets:
+      - provider: fake
+        model: echo
+  embed-default:
+    kind: embedding
+    targets:
+      - provider: ollama
+        model: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+  embed-fake:
+    kind: embedding
+    targets:
+      - provider: fake
+        model: hash-embed
+
+# USD per 1M tokens, keyed "provider/model" (or "provider/*").
+# Local models cost nothing. Paid numbers below are illustrative; check the
+# provider's current price list before relying on them.
+pricing:
+  ollama/*: { input_per_1m: 0, output_per_1m: 0 }
+  fake/*: { input_per_1m: 0, output_per_1m: 0 }
+  gemini/gemini-2.0-flash: { input_per_1m: 0.10, output_per_1m: 0.40 }
+
+auth:
+  enabled: true
+  default_rate_limit: { capacity: 60, refill_per_s: 1 }
+  keys:
+    - name: dev
+      key: ${GATEWAY_DEV_KEY:-sk-gw-dev-local-only}
+    - name: loadtest
+      key: ${GATEWAY_LOADTEST_KEY:-sk-gw-loadtest-local-only}
+      rate_limit: { capacity: 2000, refill_per_s: 1000 }
+
+retry:
+  max_attempts: 2       # per target, including the first try
+  base_delay_s: 0.2
+  max_delay_s: 2.0
+
+cache:
+  enabled: true
+  ttl_s: 3600
+  semantic:
+    enabled: ${SEMANTIC_CACHE_ENABLED:-false}
+    embedding_model: embed-default
+    threshold: 0.95
+    max_entries: 500
+
+logging:
+  log_bodies: ${LOG_BODIES:-false}
+  redact_pii: true
+
+allow_direct_models: true
