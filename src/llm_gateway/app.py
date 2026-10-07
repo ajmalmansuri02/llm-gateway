@@ -6,14 +6,14 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from opentelemetry import propagate
+from opentelemetry import propagate, trace
 from opentelemetry.trace import SpanKind
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from redis.asyncio import Redis
@@ -33,6 +33,12 @@ from llm_gateway.service import ChatService, make_embedder
 from llm_gateway.tracing import setup_tracing, tracer
 
 log = logging.getLogger("llm_gateway")
+
+_UNTRACED = frozenset({"/metrics", "/healthz", "/readyz"})
+
+
+def _exclude_from_telemetry(scope: Any) -> bool:
+    return scope.get("path") in _UNTRACED
 
 
 @dataclass
@@ -117,7 +123,16 @@ def create_app(
             await provider.aclose()
         await gw.redis.aclose()
 
-    app = FastAPI(title="llm-gateway", version=__version__, lifespan=lifespan)
+    app = FastAPI(
+        title="llm-gateway",
+        version=__version__,
+        lifespan=lifespan,
+        # Recent FastAPI releases ship native OpenTelemetry support. Exporters are set
+        # up in tracing.py, so stop FastAPI adding a second set from the environment
+        # (that duplicates every span), and keep probes out of traces. Older FastAPI
+        # versions ignore this argument.
+        telemetry={"auto_configure": False, "exclude": _exclude_from_telemetry},
+    )
     app.state.gateway = gw
 
     # ------------------------------------------------------------ middleware
@@ -126,23 +141,32 @@ def create_app(
         request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
         request.state.request_id = request_id
         started = time.perf_counter()
-        ctx = propagate.extract(dict(request.headers))
-        with tracer.start_as_current_span(
-            f"{request.method} {request.url.path}",
-            context=ctx,
-            kind=SpanKind.SERVER,
-            attributes={"http.request.method": request.method, "url.path": request.url.path},
-        ) as span:
+        path = request.url.path
+        if path in _UNTRACED or trace.get_current_span().get_span_context().is_valid:
+            # Probes are not traced; and if something upstream (FastAPI's native
+            # telemetry in recent versions, or an ASGI instrumentation) already
+            # opened a server span, reuse it instead of starting a second trace.
+            span_cm: Any = nullcontext(trace.get_current_span())
+        else:
+            span_cm = tracer.start_as_current_span(
+                f"{request.method} {path}",
+                context=propagate.extract(dict(request.headers)),
+                kind=SpanKind.SERVER,
+                attributes={"http.request.method": request.method, "url.path": path},
+            )
+        with span_cm as span:
             response = await call_next(request)
-            span.set_attribute("http.response.status_code", response.status_code)
+            if path not in _UNTRACED:
+                span.set_attribute("http.response.status_code", response.status_code)
+                span.set_attribute("gateway.request_id", request_id)
         response.headers["x-request-id"] = request_id
-        if request.url.path not in ("/metrics", "/healthz", "/readyz"):
+        if path not in _UNTRACED:
             log.info(
                 "http request",
                 extra={
                     "request_id": request_id,
                     "method": request.method,
-                    "path": request.url.path,
+                    "path": path,
                     "status": response.status_code,
                     "duration_ms": round((time.perf_counter() - started) * 1000, 2),
                     "api_key": getattr(request.state, "api_key_name", None),
